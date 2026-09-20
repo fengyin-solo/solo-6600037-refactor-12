@@ -36,6 +36,20 @@
             <label class="text-xs text-slate-500">屏幕距离 L = {{ store.params.screenDistance }} mm</label>
             <input type="range" min="100" max="2000" step="50" v-model.number="store.params.screenDistance" @input="store.compute" class="w-full accent-orange-500" />
           </div>
+          <div v-if="store.currentExperiment === 'newton'">
+            <label class="text-xs text-slate-500">暗环候选</label>
+            <select
+              :disabled="!store.darkRings.length"
+              :value="store.selectedRingOrder ?? ''"
+              @change="onRingChange(($event.target as HTMLSelectElement).value)"
+              class="w-full mt-1 bg-slate-900 border border-slate-700 rounded p-1.5 text-xs text-slate-200 disabled:text-slate-500"
+            >
+              <option value="">{{ store.darkRings.length ? '未选择暗环（空态）' : '无暗环候选' }}</option>
+              <option v-for="ring in store.darkRings" :key="ring.order" :value="ring.order">
+                第 {{ ring.order }} 暗环 · r = {{ (ring.radius * 1e3).toFixed(3) }} mm
+              </option>
+            </select>
+          </div>
         </div>
         <div class="bg-slate-800 rounded-lg p-4 border border-slate-700 text-sm">
           <h3 class="text-sm font-bold text-slate-400 mb-3">理论公式</h3>
@@ -56,6 +70,13 @@
               <div class="text-cyan-400 font-bold">牛顿环</div>
               <div>暗环半径: r = √(nλR)</div>
               <div>R: 曲率半径</div>
+              <div class="text-yellow-400 mt-1">
+                <template v-if="!store.darkRings.length">无暗环候选</template>
+                <template v-else-if="!store.selectedRing">未选择暗环（空态）</template>
+                <template v-else>
+                  第 {{ store.selectedRing.order }} 暗环 r = {{ (store.selectedRing.radius * 1e3).toFixed(3) }} mm
+                </template>
+              </div>
             </div>
           </div>
         </div>
@@ -70,8 +91,16 @@
           <canvas ref="intensityRef" class="w-full rounded" style="height: 200px; background: #0f172a;"></canvas>
         </div>
         <div class="bg-slate-800 rounded-lg p-4 border border-slate-700">
-          <h3 class="text-sm font-bold text-slate-400 mb-3">2D 热力图</h3>
-          <canvas ref="heatmapRef" class="w-full rounded" style="height: 200px; background: black;"></canvas>
+          <h3 class="text-sm font-bold text-slate-400 mb-3">
+            2D 热力图<span v-if="store.currentExperiment === 'newton'" class="text-xs font-normal text-slate-500 ml-2">点击环纹选择最近暗环</span>
+          </h3>
+          <canvas
+            ref="heatmapRef"
+            class="w-full rounded"
+            style="height: 200px; background: black;"
+            :class="store.currentExperiment === 'newton' ? 'cursor-crosshair' : ''"
+            @click="onHeatmapClick"
+          ></canvas>
         </div>
       </div>
     </div>
@@ -106,15 +135,17 @@ function wavelengthToRGB(nm: number): [number, number, number] {
 
 function drawPattern() {
   const canvas = patternRef.value
-  if (!canvas || !store.intensityData.length) return
+  if (!canvas) return
   canvas.width = canvas.clientWidth
   canvas.height = 200
   const ctx = canvas.getContext('2d')!
-  const W = canvas.width, H = canvas.height
+  // 空态：清空上一帧，不保留旧图样
   ctx.fillStyle = 'black'
-  ctx.fillRect(0, 0, W, H)
-  const [r, g, b] = wavelengthToRGB(store.params.wavelength)
+  ctx.fillRect(0, 0, canvas.width, canvas.height)
   const data = store.intensityData
+  if (!data.length) return
+  const W = canvas.width, H = canvas.height
+  const [r, g, b] = wavelengthToRGB(store.params.wavelength)
   for (let x = 0; x < W; x++) {
     const idx = Math.round(x / W * (data.length - 1))
     const intensity = data[idx] || 0
@@ -126,15 +157,17 @@ function drawPattern() {
 
 function drawIntensity() {
   const canvas = intensityRef.value
-  if (!canvas || !store.intensityData.length) return
+  if (!canvas) return
   canvas.width = canvas.clientWidth
   canvas.height = 200
   const ctx = canvas.getContext('2d')!
   const W = canvas.width, H = canvas.height
+  // 空态：清空上一帧，不保留旧曲线
   ctx.fillStyle = '#0f172a'
   ctx.fillRect(0, 0, W, H)
-  const [r, g, b] = wavelengthToRGB(store.params.wavelength)
   const data = store.intensityData
+  if (!data.length) return
+  const [r, g, b] = wavelengthToRGB(store.params.wavelength)
   ctx.beginPath()
   ctx.strokeStyle = `rgb(${r},${g},${b})`
   ctx.lineWidth = 2
@@ -158,13 +191,50 @@ function drawIntensity() {
 
 function drawHeatmap() {
   const canvas = heatmapRef.value
-  if (!canvas || !store.intensityData.length) return
+  if (!canvas) return
   canvas.width = canvas.clientWidth
   canvas.height = 200
   const ctx = canvas.getContext('2d')!
   const W = canvas.width, H = canvas.height
-  const [r, g, b] = wavelengthToRGB(store.params.wavelength)
+  // 空态：清空上一帧，不保留旧图样（含暗环标记）
+  ctx.fillStyle = 'black'
+  ctx.fillRect(0, 0, W, H)
   const data = store.intensityData
+  if (!data.length) return
+  const [r, g, b] = wavelengthToRGB(store.params.wavelength)
+
+  if (store.currentExperiment === 'newton') {
+    // 径向同心环：与一维剖面共用同一份强度数据和波长配色
+    const cx = W / 2, cy = H / 2
+    const scale = cy / store.NEWTON_RADIUS_MAX_MM
+    const imgData = ctx.createImageData(W, H)
+    for (let py = 0; py < H; py++) {
+      for (let px = 0; px < W; px++) {
+        const rho = Math.sqrt((px - cx) ** 2 + (py - cy) ** 2)
+        const idx = Math.min(data.length - 1, Math.round(rho / scale / store.NEWTON_RADIUS_MAX_MM * (data.length - 1)))
+        const intensity = Math.min(1, data[idx] || 0)
+        const pos = (py * W + px) * 4
+        imgData.data[pos] = r
+        imgData.data[pos + 1] = g
+        imgData.data[pos + 2] = b
+        imgData.data[pos + 3] = intensity * 255
+      }
+    }
+    ctx.putImageData(imgData, 0, 0)
+
+    // 当前选择的暗环标记：选择、图样、结果同源（selectedRing）
+    if (store.selectedRing) {
+      ctx.beginPath()
+      ctx.strokeStyle = '#22d3ee'
+      ctx.lineWidth = 1.5
+      ctx.setLineDash([4, 4])
+      ctx.arc(cx, cy, store.selectedRing.radius * 1e3 * scale, 0, Math.PI * 2)
+      ctx.stroke()
+      ctx.setLineDash([])
+    }
+    return
+  }
+
   const imgData = ctx.createImageData(W, H)
   for (let x = 0; x < W; x++) {
     const idx = Math.round(x / W * (data.length - 1))
@@ -179,8 +249,29 @@ function drawHeatmap() {
   ctx.putImageData(imgData, 0, 0)
 }
 
+/** 点击 2D 同心环：以点击点到中心的物理半径就近选择暗环 */
+function onHeatmapClick(event: MouseEvent) {
+  if (store.currentExperiment !== 'newton' || !store.darkRings.length) return
+  const canvas = heatmapRef.value
+  if (!canvas) return
+  const rect = canvas.getBoundingClientRect()
+  const cx = rect.width / 2, cy = rect.height / 2
+  const scale = cy / store.NEWTON_RADIUS_MAX_MM
+  const radiusMm = Math.sqrt(((event.clientX - rect.left) - cx) ** 2 / scale ** 2
+    + ((event.clientY - rect.top) - cy) ** 2 / scale ** 2)
+  store.selectRingAtRadius(radiusMm)
+}
+
+function onRingChange(value: string) {
+  store.selectRing(value === '' ? null : Number(value))
+}
+
 function renderAll() { drawPattern(); drawIntensity(); drawHeatmap() }
 
 onMounted(() => { store.compute(); setTimeout(renderAll, 100) })
-watch(() => store.intensityData, () => renderAll(), { deep: true })
+// 数据或当前暗环选择变化都需重绘，保证选择、二维图样与结果一致
+watch(
+  () => [store.intensityData, store.selectedRingOrder, store.currentExperiment],
+  () => renderAll(),
+)
 </script>
